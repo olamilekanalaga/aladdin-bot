@@ -1,4 +1,6 @@
-# Aladdin Vlak Bot
+# Vlak Bot
+
+> New developer? Start with the [developer onboarding guide](docs/README.md).
 
 This bot receives raw token calls from the Vlak API, records them, checks their performance, and sends selected tokens to Telegram.
 
