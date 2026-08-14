@@ -1,9 +1,11 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import sqlite3
+import os
 from pathlib import Path
 
-DB_PATH = Path(r"C:\Users\alaga\Desktop\My Script Library\Web 3\UNKOWN\v3\vlak_aladdin_research.sqlite")
+ROOT = Path(__file__).resolve().parent
+DB_PATH = Path(os.getenv("DATABASE_PATH", str(ROOT / "vlak_aladdin_research.sqlite")))
 
 SCHEMA_SQL = """
 PRAGMA journal_mode=WAL;
@@ -222,6 +224,40 @@ CREATE TABLE IF NOT EXISTS telegram_survivor_milestones (
 
 CREATE INDEX IF NOT EXISTS idx_telegram_survivor_milestones_mint ON telegram_survivor_milestones(mint);
 
+CREATE TABLE IF NOT EXISTS telegram_entry_outcomes (
+    mint TEXT PRIMARY KEY,
+    telegram_alerted_at TEXT,
+    telegram_entry_multiple REAL,
+    telegram_entry_market_cap REAL,
+    latest_snapshot_time TEXT,
+    current_mc REAL,
+    ath_market_cap REAL,
+    max_multiple_from_first_spotted REAL,
+    max_multiple_from_telegram_entry REAL,
+    hit_20pct_after_telegram INTEGER DEFAULT 0,
+    hit_50pct_after_telegram INTEGER DEFAULT 0,
+    hit_2x_after_telegram INTEGER DEFAULT 0,
+    hit_3x_after_telegram INTEGER DEFAULT 0,
+    hit_5x_after_telegram INTEGER DEFAULT 0,
+    hit_10x_after_telegram INTEGER DEFAULT 0,
+    outcome_source TEXT NOT NULL DEFAULT 'derived_from_existing_outcomes',
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS telegram_entry_outcome_milestones (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    mint TEXT NOT NULL,
+    threshold REAL NOT NULL,
+    multiple_at_send REAL,
+    overall_multiple_at_send REAL,
+    telegram_message_id INTEGER,
+    sent_at TEXT NOT NULL,
+    source TEXT NOT NULL DEFAULT 'telegram_entry',
+    UNIQUE(mint, threshold)
+);
+
+CREATE INDEX IF NOT EXISTS idx_telegram_entry_outcome_milestones_mint ON telegram_entry_outcome_milestones(mint);
+
 CREATE TABLE IF NOT EXISTS telegram_survivor_active_polling (
     mint TEXT PRIMARY KEY,
     status TEXT NOT NULL DEFAULT 'active',
@@ -418,7 +454,8 @@ def migrate(db_path: Path = DB_PATH) -> None:
 
 
 if __name__ == "__main__":
-    migrate()
+    migrate(DB_PATH)
     print(f"Vlak long-run schema ready: {DB_PATH}")
+
 
 

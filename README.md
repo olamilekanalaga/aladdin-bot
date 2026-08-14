@@ -1,4 +1,4 @@
-# Vlak Bot
+﻿# Aladdin Bot
 
 > New developer? Start with the [developer onboarding guide](docs/README.md).
 
@@ -187,6 +187,27 @@ DATABASE_PATH=vlak_aladdin_research.sqlite
 
 Never commit `.env`.
 
+
+## Railway deployment
+
+Deploy this repository as a Railway worker service, not as a website.
+
+Start command:
+
+```bash
+python vlak_long_run_collector.py
+```
+
+Attach a Railway persistent volume mounted at `/data` and set:
+
+```dotenv
+DATABASE_PATH=/data/vlak_aladdin_research.sqlite
+TZ=Europe/London
+```
+
+Put real secrets only in Railway Variables. Do not commit `.env`.
+
+Required Railway variables are listed in `.env.example`.
 ## Starting the bot
 
 ```powershell
@@ -226,3 +247,4 @@ Check the logs, then set `TELEGRAM_SURVIVOR_DRY_RUN=false` only when ready.
 - ML training scripts and model files
 
 This repository is a code backup. Restoring historical data requires a separate private database backup.
+

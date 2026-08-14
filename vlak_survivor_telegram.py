@@ -298,6 +298,21 @@ def ath_update_marker(max_multiple: float) -> float:
     return max(ROOT_THRESHOLD, int(max_multiple / ATH_UPDATE_STEP_MULTIPLE) * ATH_UPDATE_STEP_MULTIPLE)
 
 
+def telegram_entry_outcome_multiple(overall_multiple: Any, entry_multiple: Any) -> float | None:
+    try:
+        overall = float(overall_multiple)
+        entry = float(entry_multiple)
+    except (TypeError, ValueError):
+        return None
+    if overall <= 0 or entry <= 0:
+        return None
+    return overall / entry
+
+
+def telegram_entry_update_marker(entry_outcome_multiple: float) -> float:
+    return max(1.0, int(entry_outcome_multiple / ATH_UPDATE_STEP_MULTIPLE) * ATH_UPDATE_STEP_MULTIPLE)
+
+
 def threshold_list_text(thresholds: list[float], prefix: str = "") -> str:
     if not thresholds:
         return "None"
@@ -332,6 +347,7 @@ class SurvivorTelegramAlerts:
         return conn
 
     def ensure_shadow_alerts_table(self, conn: sqlite3.Connection) -> None:
+        self.ensure_telegram_entry_outcome_tables(conn)
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS vlak_shadow_tracking_sessions (
@@ -425,6 +441,111 @@ class SurvivorTelegramAlerts:
             if column not in existing:
                 conn.execute(f"ALTER TABLE vlak_shadow_alerts ADD COLUMN {column} {definition}")
         conn.commit()
+
+    def ensure_telegram_entry_outcome_tables(self, conn: sqlite3.Connection) -> None:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS telegram_entry_outcomes (
+                mint TEXT PRIMARY KEY,
+                telegram_alerted_at TEXT,
+                telegram_entry_multiple REAL,
+                telegram_entry_market_cap REAL,
+                latest_snapshot_time TEXT,
+                current_mc REAL,
+                ath_market_cap REAL,
+                max_multiple_from_first_spotted REAL,
+                max_multiple_from_telegram_entry REAL,
+                hit_20pct_after_telegram INTEGER DEFAULT 0,
+                hit_50pct_after_telegram INTEGER DEFAULT 0,
+                hit_2x_after_telegram INTEGER DEFAULT 0,
+                hit_3x_after_telegram INTEGER DEFAULT 0,
+                hit_5x_after_telegram INTEGER DEFAULT 0,
+                hit_10x_after_telegram INTEGER DEFAULT 0,
+                outcome_source TEXT NOT NULL DEFAULT 'derived_from_existing_outcomes',
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS telegram_entry_outcome_milestones (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                mint TEXT NOT NULL,
+                threshold REAL NOT NULL,
+                multiple_at_send REAL,
+                overall_multiple_at_send REAL,
+                telegram_message_id INTEGER,
+                sent_at TEXT NOT NULL,
+                source TEXT NOT NULL DEFAULT 'telegram_entry',
+                UNIQUE(mint, threshold)
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_telegram_entry_outcome_milestones_mint
+            ON telegram_entry_outcome_milestones(mint)
+            """
+        )
+        conn.commit()
+
+    def upsert_telegram_entry_outcome(self, conn: sqlite3.Connection, row: sqlite3.Row, thread: sqlite3.Row, now: str) -> float | None:
+        entry_multiple = telegram_entry_outcome_multiple(row["max_multiple"], thread["first_alert_multiple"])
+        if entry_multiple is None:
+            return None
+        first_mc = row["first_call_market_cap"] or row["first_alert_market_cap"]
+        try:
+            entry_mc = float(first_mc) * float(thread["first_alert_multiple"]) if first_mc and thread["first_alert_multiple"] else None
+        except (TypeError, ValueError):
+            entry_mc = None
+        conn.execute(
+            """
+            INSERT INTO telegram_entry_outcomes (
+                mint, telegram_alerted_at, telegram_entry_multiple, telegram_entry_market_cap,
+                latest_snapshot_time, current_mc, ath_market_cap, max_multiple_from_first_spotted,
+                max_multiple_from_telegram_entry, hit_20pct_after_telegram, hit_50pct_after_telegram,
+                hit_2x_after_telegram, hit_3x_after_telegram, hit_5x_after_telegram,
+                hit_10x_after_telegram, outcome_source, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'derived_from_existing_outcomes', ?)
+            ON CONFLICT(mint) DO UPDATE SET
+                telegram_alerted_at=excluded.telegram_alerted_at,
+                telegram_entry_multiple=excluded.telegram_entry_multiple,
+                telegram_entry_market_cap=excluded.telegram_entry_market_cap,
+                latest_snapshot_time=excluded.latest_snapshot_time,
+                current_mc=excluded.current_mc,
+                ath_market_cap=MAX(COALESCE(telegram_entry_outcomes.ath_market_cap, 0), COALESCE(excluded.ath_market_cap, 0)),
+                max_multiple_from_first_spotted=MAX(COALESCE(telegram_entry_outcomes.max_multiple_from_first_spotted, 0), COALESCE(excluded.max_multiple_from_first_spotted, 0)),
+                max_multiple_from_telegram_entry=MAX(COALESCE(telegram_entry_outcomes.max_multiple_from_telegram_entry, 0), COALESCE(excluded.max_multiple_from_telegram_entry, 0)),
+                hit_20pct_after_telegram=MAX(COALESCE(telegram_entry_outcomes.hit_20pct_after_telegram, 0), excluded.hit_20pct_after_telegram),
+                hit_50pct_after_telegram=MAX(COALESCE(telegram_entry_outcomes.hit_50pct_after_telegram, 0), excluded.hit_50pct_after_telegram),
+                hit_2x_after_telegram=MAX(COALESCE(telegram_entry_outcomes.hit_2x_after_telegram, 0), excluded.hit_2x_after_telegram),
+                hit_3x_after_telegram=MAX(COALESCE(telegram_entry_outcomes.hit_3x_after_telegram, 0), excluded.hit_3x_after_telegram),
+                hit_5x_after_telegram=MAX(COALESCE(telegram_entry_outcomes.hit_5x_after_telegram, 0), excluded.hit_5x_after_telegram),
+                hit_10x_after_telegram=MAX(COALESCE(telegram_entry_outcomes.hit_10x_after_telegram, 0), excluded.hit_10x_after_telegram),
+                outcome_source=excluded.outcome_source,
+                updated_at=excluded.updated_at
+            """,
+            (
+                row["mint"],
+                thread["first_alerted_at"],
+                thread["first_alert_multiple"],
+                entry_mc,
+                row["latest_snapshot_time"],
+                row["current_mc"],
+                row["ath_market_cap"],
+                row["max_multiple"],
+                entry_multiple,
+                int(entry_multiple >= 1.2),
+                int(entry_multiple >= 1.5),
+                int(entry_multiple >= 2),
+                int(entry_multiple >= 3),
+                int(entry_multiple >= 5),
+                int(entry_multiple >= 10),
+                now,
+            ),
+        )
+        return entry_multiple
 
     def active_shadow_session_id(self, conn: sqlite3.Connection) -> str | None:
         row = conn.execute(
@@ -540,6 +661,8 @@ class SurvivorTelegramAlerts:
                 e.name,
                 e.alert_time,
                 o.first_alert_time,
+                t.first_alerted_at AS telegram_alerted_at,
+                t.first_alert_multiple AS telegram_entry_multiple,
                 COALESCE(o.first_call_market_cap, e.first_call_market_cap) AS first_call_market_cap,
                 e.market_cap AS first_alert_market_cap,
                 e.liquidity AS first_alert_liquidity,
@@ -560,10 +683,29 @@ class SurvivorTelegramAlerts:
                         ELSE 0
                     END
                 ) AS max_multiple,
+                CASE
+                    WHEN t.first_alert_multiple > 0 THEN
+                        MAX(
+                            COALESCE(o.max_multiple, 0),
+                            CASE
+                                WHEN COALESCE(o.first_call_market_cap, e.first_call_market_cap) > 0
+                                 AND mb.max_metric_market_cap IS NOT NULL
+                                THEN mb.max_metric_market_cap / COALESCE(o.first_call_market_cap, e.first_call_market_cap)
+                                ELSE 0
+                            END
+                        ) / t.first_alert_multiple
+                    ELSE NULL
+                END AS telegram_entry_outcome_multiple,
+                CASE
+                    WHEN t.first_alert_multiple > 0 AND COALESCE(o.first_call_market_cap, e.first_call_market_cap) > 0
+                    THEN COALESCE(o.first_call_market_cap, e.first_call_market_cap) * t.first_alert_multiple
+                    ELSE NULL
+                END AS telegram_entry_market_cap,
                 COALESCE(mb.latest_metric_snapshot_time, o.latest_snapshot_time) AS latest_snapshot_time
             FROM vlak_token_outcomes o
             LEFT JOIN first_event e ON e.mint = o.mint
             LEFT JOIN metric_best mb ON mb.mint = o.mint
+            LEFT JOIN telegram_survivor_threads t ON t.mint = o.mint
             WHERE o.mint = ?
             """,
             (mint, mint, mint),
@@ -598,6 +740,24 @@ class SurvivorTelegramAlerts:
             "SELECT survivor_alerts_live_start_at FROM telegram_survivor_live_state WHERE source = 'vlak'"
         ).fetchone()
         return row["survivor_alerts_live_start_at"] if row and row["survivor_alerts_live_start_at"] else None
+
+    def get_or_create_telegram_entry_outcome_live_start_at(self, conn: sqlite3.Connection, now: str) -> str:
+        row = conn.execute(
+            "SELECT value FROM vlak_bot_config WHERE key = 'telegram_entry_outcome_live_start_at'"
+        ).fetchone()
+        if row and row["value"]:
+            return row["value"]
+        conn.execute(
+            """
+            INSERT INTO vlak_bot_config (key, value, updated_at)
+            VALUES ('telegram_entry_outcome_live_start_at', ?, ?)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+            """,
+            (now, now),
+        )
+        conn.commit()
+        logger.warning("Created Telegram-entry outcome live-start cutoff at %s", now)
+        return now
 
     def get_or_create_live_start_at(self, conn: sqlite3.Connection, now: str) -> str | None:
         configured = self.configured_live_start_at()
@@ -1199,8 +1359,7 @@ class SurvivorTelegramAlerts:
                 "",
                 f"┌ {mdv2_bold(name)} \\| {mdv2_bold('#' + symbol)}",
                 f"├ Label: {mdv2_bold(label)}",
-                f"├ First Spotted MC: {mdv2_bold(fmt_money(first_mc))}",
-                f"├ Current MC: {mdv2_bold(fmt_money(current_mc))}",
+                f"├ Market Cap: {mdv2_bold(fmt_money(current_mc))}",
                 f"├ Liq: {mdv2_bold(fmt_money(raw.get('liquidity') or row['first_alert_liquidity']))}",
                 f"├ Vol: {mdv2_bold(fmt_money(raw.get('vol1h')))} \\| Total Fees: {mdv2_bold(raw_number(raw.get('totalFee'), 2) + ' SOL')}",
                 f"├ Age: {mdv2_bold(age)}",
@@ -1219,7 +1378,7 @@ class SurvivorTelegramAlerts:
         row = conn.execute(
             """
             SELECT sent_at
-            FROM telegram_survivor_milestones
+            FROM telegram_entry_outcome_milestones
             WHERE mint = ? AND threshold < ?
             ORDER BY threshold DESC
             LIMIT 1
@@ -1233,15 +1392,16 @@ class SurvivorTelegramAlerts:
 
     def format_milestone_message(self, row: sqlite3.Row, threshold: float, previous_sent_at: str | None) -> str:
         symbol = row["symbol"] or "UNKNOWN"
-        first_mc = row["first_call_market_cap"] or row["first_alert_market_cap"]
+        entry_mc = row["telegram_entry_market_cap"]
         target_mc = row["ath_market_cap"] or row["current_mc"]
-        first_spotted_at = row["first_alert_time"] or row["alert_time"]
+        telegram_alerted_at = row["telegram_alerted_at"]
         milestone_observed_at = row["latest_snapshot_time"] or utc_now_iso()
+        entry_outcome = row["telegram_entry_outcome_multiple"]
         return "\n".join(
             [
-                f"\U0001F525\U0001F525\U0001F525 {fmt_multiple(row['max_multiple'])}",
+                f"\U0001F525\U0001F525\U0001F525 {fmt_multiple(entry_outcome)} from Telegram entry",
                 "",
-                f"#{symbol}  {fmt_money(first_mc)} \u2197\ufe0f {fmt_money(target_mc)} within {elapsed_text(first_spotted_at, milestone_observed_at)} from first spotted",
+                f"#{symbol}  {fmt_money(entry_mc)} \u2197\ufe0f {fmt_money(target_mc)} within {elapsed_text(telegram_alerted_at, milestone_observed_at)} from Telegram alert",
                 "",
                 "credit: Aladdin",
             ]
@@ -1285,15 +1445,6 @@ class SurvivorTelegramAlerts:
             if row is None or row["max_multiple"] is None:
                 return
             max_multiple = float(row["max_multiple"] or 0)
-            last_sent_row = conn.execute(
-                """
-                SELECT MAX(multiple_at_send) AS last_sent_multiple
-                FROM telegram_survivor_milestones
-                WHERE mint = ? AND multiple_at_send IS NOT NULL
-                """,
-                (mint,),
-            ).fetchone()
-            last_sent_multiple = float(last_sent_row["last_sent_multiple"] or thread["first_alert_multiple"] or ROOT_THRESHOLD)
             root_dt = parse_time(thread["first_alerted_at"])
             cutoff_dt = parse_time(MILESTONE_ROOT_ALERT_CUTOFF_AT)
             if not root_dt or not cutoff_dt or root_dt < cutoff_dt:
@@ -1304,16 +1455,39 @@ class SurvivorTelegramAlerts:
                     MILESTONE_ROOT_ALERT_CUTOFF_AT,
                 )
                 return
+            entry_live_start_at = self.get_or_create_telegram_entry_outcome_live_start_at(conn, now)
+            entry_live_dt = parse_time(entry_live_start_at)
+            if not entry_live_dt or root_dt < entry_live_dt:
+                logger.info(
+                    "Telegram-entry outcome milestone suppressed before entry-outcome live start mint=%s root_alert=%s cutoff=%s",
+                    mint,
+                    thread["first_alerted_at"],
+                    entry_live_start_at,
+                )
+                return
+            entry_outcome_multiple = self.upsert_telegram_entry_outcome(conn, row, thread, now)
+            if entry_outcome_multiple is None:
+                return
+            conn.commit()
+            last_sent_row = conn.execute(
+                """
+                SELECT MAX(multiple_at_send) AS last_sent_multiple
+                FROM telegram_entry_outcome_milestones
+                WHERE mint = ? AND multiple_at_send IS NOT NULL
+                """,
+                (mint,),
+            ).fetchone()
+            last_sent_multiple = float(last_sent_row["last_sent_multiple"] or 1.0)
             existing = {
                 float(r["threshold"])
                 for r in conn.execute(
-                    "SELECT threshold FROM telegram_survivor_milestones WHERE mint = ?",
+                    "SELECT threshold FROM telegram_entry_outcome_milestones WHERE mint = ?",
                     (mint,),
                 ).fetchall()
             }
-            missing_fixed = [t for t in REPLY_THRESHOLDS if max_multiple >= t and float(t) not in existing]
-            should_send_update = max_multiple >= last_sent_multiple + ATH_UPDATE_STEP_MULTIPLE
-            update_marker = ath_update_marker(max_multiple)
+            missing_fixed = [t for t in REPLY_THRESHOLDS if entry_outcome_multiple >= t and float(t) not in existing]
+            should_send_update = entry_outcome_multiple >= last_sent_multiple + ATH_UPDATE_STEP_MULTIPLE
+            update_marker = telegram_entry_update_marker(entry_outcome_multiple)
             marker_exists = float(update_marker) in existing
 
         if missing_fixed or (should_send_update and not marker_exists):
@@ -1428,28 +1602,32 @@ class SurvivorTelegramAlerts:
             if self.is_shadow_excluded(conn, mint):
                 return
             max_multiple = float(row["max_multiple"] or 0)
+            entry_outcome_multiple = self.upsert_telegram_entry_outcome(conn, row, thread, now)
+            if entry_outcome_multiple is None:
+                return
+            conn.commit()
             last_sent_row = conn.execute(
                 """
                 SELECT MAX(multiple_at_send) AS last_sent_multiple
-                FROM telegram_survivor_milestones
+                FROM telegram_entry_outcome_milestones
                 WHERE mint = ? AND multiple_at_send IS NOT NULL
                 """,
                 (mint,),
             ).fetchone()
-            last_sent_multiple = float(last_sent_row["last_sent_multiple"] or thread["first_alert_multiple"] or ROOT_THRESHOLD)
-            update_marker = ath_update_marker(max_multiple)
+            last_sent_multiple = float(last_sent_row["last_sent_multiple"] or 1.0)
+            update_marker = telegram_entry_update_marker(entry_outcome_multiple)
             existing = {
                 float(r["threshold"])
                 for r in conn.execute(
-                    "SELECT threshold FROM telegram_survivor_milestones WHERE mint = ?",
+                    "SELECT threshold FROM telegram_entry_outcome_milestones WHERE mint = ?",
                     (mint,),
                 ).fetchall()
             }
             requested = list(thresholds_to_mark or [])
-            requested.extend(t for t in REPLY_THRESHOLDS if max_multiple >= t)
-            if max_multiple >= last_sent_multiple + ATH_UPDATE_STEP_MULTIPLE:
+            requested.extend(t for t in REPLY_THRESHOLDS if entry_outcome_multiple >= t)
+            if entry_outcome_multiple >= last_sent_multiple + ATH_UPDATE_STEP_MULTIPLE:
                 requested.append(update_marker)
-            thresholds_to_mark = sorted({float(t) for t in requested if max_multiple >= float(t) and float(t) not in existing})
+            thresholds_to_mark = sorted({float(t) for t in requested if entry_outcome_multiple >= float(t) and float(t) not in existing})
             if not thresholds_to_mark:
                 return
             threshold = max(thresholds_to_mark)
@@ -1467,11 +1645,11 @@ class SurvivorTelegramAlerts:
             for mark_threshold in thresholds_to_mark:
                 cur = conn.execute(
                     """
-                    INSERT OR IGNORE INTO telegram_survivor_milestones
-                    (mint, threshold, multiple_at_send, telegram_message_id, sent_at, source)
-                    VALUES (?, ?, ?, NULL, ?, 'vlak')
+                    INSERT OR IGNORE INTO telegram_entry_outcome_milestones
+                    (mint, threshold, multiple_at_send, overall_multiple_at_send, telegram_message_id, sent_at, source)
+                    VALUES (?, ?, ?, ?, NULL, ?, 'telegram_entry')
                     """,
-                    (mint, mark_threshold, max_multiple, now),
+                    (mint, mark_threshold, entry_outcome_multiple, max_multiple, now),
                 )
                 if cur.rowcount:
                     inserted.append(mark_threshold)
@@ -1486,7 +1664,7 @@ class SurvivorTelegramAlerts:
             with self.connect() as conn:
                 for mark_threshold in inserted:
                     conn.execute(
-                        "DELETE FROM telegram_survivor_milestones WHERE mint = ? AND threshold = ? AND telegram_message_id IS NULL",
+                        "DELETE FROM telegram_entry_outcome_milestones WHERE mint = ? AND threshold = ? AND telegram_message_id IS NULL",
                         (mint, mark_threshold),
                     )
                 conn.commit()
@@ -1496,7 +1674,7 @@ class SurvivorTelegramAlerts:
             with self.connect() as conn:
                 for mark_threshold in inserted:
                     conn.execute(
-                        "DELETE FROM telegram_survivor_milestones WHERE mint = ? AND threshold = ? AND telegram_message_id IS NULL",
+                        "DELETE FROM telegram_entry_outcome_milestones WHERE mint = ? AND threshold = ? AND telegram_message_id IS NULL",
                         (mint, mark_threshold),
                     )
                 conn.commit()
@@ -1505,7 +1683,7 @@ class SurvivorTelegramAlerts:
         with self.connect() as conn:
             for mark_threshold in inserted:
                 conn.execute(
-                    "UPDATE telegram_survivor_milestones SET telegram_message_id = ? WHERE mint = ? AND threshold = ?",
+                    "UPDATE telegram_entry_outcome_milestones SET telegram_message_id = ? WHERE mint = ? AND threshold = ?",
                     (message_id, mint, mark_threshold),
                 )
             conn.commit()
