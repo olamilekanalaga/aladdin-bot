@@ -742,6 +742,18 @@ class SurvivorTelegramAlerts:
         return row["survivor_alerts_live_start_at"] if row and row["survivor_alerts_live_start_at"] else None
 
     def get_or_create_telegram_entry_outcome_live_start_at(self, conn: sqlite3.Connection, now: str) -> str:
+        configured = self.configured_live_start_at()
+        if configured:
+            conn.execute(
+                """
+                INSERT INTO vlak_bot_config (key, value, updated_at)
+                VALUES ('telegram_entry_outcome_live_start_at', ?, ?)
+                ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+                """,
+                (configured, now),
+            )
+            conn.commit()
+            return configured
         row = conn.execute(
             "SELECT value FROM vlak_bot_config WHERE key = 'telegram_entry_outcome_live_start_at'"
         ).fetchone()
@@ -1570,6 +1582,11 @@ class SurvivorTelegramAlerts:
             from survivor_stage_ml_shadow import score_survivor_alert
 
             score_survivor_alert(mint)
+        except ModuleNotFoundError as exc:
+            if exc.name != "survivor_stage_ml_shadow":
+                logger.warning("Survivor CatBoost shadow scoring failed mint=%s error=%s", mint, exc)
+            else:
+                logger.info("Survivor CatBoost shadow scoring skipped mint=%s reason=module_not_deployed", mint)
         except Exception as exc:
             logger.warning("Survivor CatBoost shadow scoring failed mint=%s error=%s", mint, exc)
 
