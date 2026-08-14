@@ -81,8 +81,10 @@ def elapsed_text(start: Any, end: Any | None = None) -> str:
         return "n/a"
     seconds = max(0, int((end_dt - start_dt).total_seconds()))
     minutes = seconds // 60
+    if seconds < 60:
+        return f"{seconds}s" if seconds > 0 else "0s"
     if minutes < 60:
-        return f"{minutes} minutes"
+        return "1 minute" if minutes == 1 else f"{minutes} minutes"
     hours = minutes // 60
     remain = minutes % 60
     if hours < 48:
@@ -476,11 +478,17 @@ class SurvivorTelegramAlerts:
                 overall_multiple_at_send REAL,
                 telegram_message_id INTEGER,
                 sent_at TEXT NOT NULL,
+                threshold_observed_at TEXT,
                 source TEXT NOT NULL DEFAULT 'telegram_entry',
                 UNIQUE(mint, threshold)
             )
             """
         )
+        try:
+            conn.execute("ALTER TABLE telegram_entry_outcome_milestones ADD COLUMN threshold_observed_at TEXT")
+        except sqlite3.OperationalError as exc:
+            if "duplicate column name" not in str(exc).lower():
+                raise
         conn.execute(
             """
             CREATE INDEX IF NOT EXISTS idx_telegram_entry_outcome_milestones_mint
@@ -1389,7 +1397,7 @@ class SurvivorTelegramAlerts:
     def previous_milestone_time(self, conn: sqlite3.Connection, mint: str, threshold: float) -> str | None:
         row = conn.execute(
             """
-            SELECT sent_at
+            SELECT COALESCE(threshold_observed_at, sent_at) AS sent_at
             FROM telegram_entry_outcome_milestones
             WHERE mint = ? AND threshold < ?
             ORDER BY threshold DESC
@@ -1402,12 +1410,37 @@ class SurvivorTelegramAlerts:
         thread = conn.execute("SELECT first_alerted_at FROM telegram_survivor_threads WHERE mint = ?", (mint,)).fetchone()
         return thread["first_alerted_at"] if thread else None
 
-    def format_milestone_message(self, row: sqlite3.Row, threshold: float, previous_sent_at: str | None) -> str:
+    def threshold_observed_at(self, conn: sqlite3.Connection, row: sqlite3.Row, threshold: float, fallback: str) -> str:
+        entry_mc = row["telegram_entry_market_cap"]
+        telegram_alerted_at = row["telegram_alerted_at"]
+        if entry_mc is None or telegram_alerted_at is None:
+            return fallback
+        try:
+            target_mc = float(entry_mc) * float(threshold)
+        except (TypeError, ValueError):
+            return fallback
+        snap = conn.execute(
+            """
+            SELECT snapshot_time
+            FROM vlak_metric_snapshots
+            WHERE mint = ?
+              AND snapshot_time >= ?
+              AND market_cap >= ?
+            ORDER BY snapshot_time ASC
+            LIMIT 1
+            """,
+            (row["mint"], telegram_alerted_at, target_mc),
+        ).fetchone()
+        if snap and snap["snapshot_time"]:
+            return snap["snapshot_time"]
+        return fallback
+
+    def format_milestone_message(self, row: sqlite3.Row, threshold: float, threshold_observed_at: str | None, previous_sent_at: str | None) -> str:
         symbol = row["symbol"] or "UNKNOWN"
         entry_mc = row["telegram_entry_market_cap"]
         target_mc = row["ath_market_cap"] or row["current_mc"]
         telegram_alerted_at = row["telegram_alerted_at"]
-        milestone_observed_at = row["latest_snapshot_time"] or utc_now_iso()
+        milestone_observed_at = threshold_observed_at or row["latest_snapshot_time"] or utc_now_iso()
         entry_outcome = row["telegram_entry_outcome_multiple"]
         return "\n".join(
             [
@@ -1650,6 +1683,10 @@ class SurvivorTelegramAlerts:
             threshold = max(thresholds_to_mark)
             first_new_threshold = min(thresholds_to_mark)
             previous_sent_at = self.previous_milestone_time(conn, mint, first_new_threshold)
+            threshold_observed_times = {
+                mark_threshold: self.threshold_observed_at(conn, row, mark_threshold, row["latest_snapshot_time"] or now)
+                for mark_threshold in thresholds_to_mark
+            }
             if self.dry_run:
                 logger.info(
                     "DRY RUN survivor milestone eligible mint=%s thresholds=%s multiple=%s",
@@ -1663,17 +1700,17 @@ class SurvivorTelegramAlerts:
                 cur = conn.execute(
                     """
                     INSERT OR IGNORE INTO telegram_entry_outcome_milestones
-                    (mint, threshold, multiple_at_send, overall_multiple_at_send, telegram_message_id, sent_at, source)
-                    VALUES (?, ?, ?, ?, NULL, ?, 'telegram_entry')
+                    (mint, threshold, multiple_at_send, overall_multiple_at_send, telegram_message_id, sent_at, threshold_observed_at, source)
+                    VALUES (?, ?, ?, ?, NULL, ?, ?, 'telegram_entry')
                     """,
-                    (mint, mark_threshold, entry_outcome_multiple, max_multiple, now),
+                    (mint, mark_threshold, entry_outcome_multiple, max_multiple, now, threshold_observed_times.get(mark_threshold)),
                 )
                 if cur.rowcount:
                     inserted.append(mark_threshold)
             conn.commit()
             if not inserted:
                 return
-            text = self.format_milestone_message(row, threshold, previous_sent_at)
+            text = self.format_milestone_message(row, threshold, threshold_observed_times.get(threshold), previous_sent_at)
             root_message_id = int(thread["root_message_id"])
         try:
             message_id = await self.send_message(text, reply_to_message_id=root_message_id)

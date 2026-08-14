@@ -252,6 +252,7 @@ CREATE TABLE IF NOT EXISTS telegram_entry_outcome_milestones (
     overall_multiple_at_send REAL,
     telegram_message_id INTEGER,
     sent_at TEXT NOT NULL,
+    threshold_observed_at TEXT,
     source TEXT NOT NULL DEFAULT 'telegram_entry',
     UNIQUE(mint, threshold)
 );
@@ -450,6 +451,11 @@ def migrate(db_path: Path = DB_PATH) -> None:
     db_path.parent.mkdir(parents=True, exist_ok=True)
     with sqlite3.connect(db_path) as conn:
         conn.executescript(SCHEMA_SQL)
+        try:
+            conn.execute("ALTER TABLE telegram_entry_outcome_milestones ADD COLUMN threshold_observed_at TEXT")
+        except sqlite3.OperationalError as exc:
+            if "duplicate column name" not in str(exc).lower():
+                raise
         conn.commit()
 
 
